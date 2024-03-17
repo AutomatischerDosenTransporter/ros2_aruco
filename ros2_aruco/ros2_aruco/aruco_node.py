@@ -36,7 +36,7 @@ import cv2
 import tf_transformations
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray, Pose
+from geometry_msgs.msg import PoseArray, Pose, Pose2D
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
@@ -67,6 +67,15 @@ class ArucoNode(rclpy.node.Node):
         self.declare_parameter(
             name="image_topic",
             value="/camera/image_raw",
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_STRING,
+                description="Image topic to subscribe to.",
+            ),
+        )
+
+        self.declare_parameter(
+            name="image_out_topic",
+            value="/camera/image_out",
             descriptor=ParameterDescriptor(
                 type=ParameterType.PARAMETER_STRING,
                 description="Image topic to subscribe to.",
@@ -106,6 +115,12 @@ class ArucoNode(rclpy.node.Node):
         )
         self.get_logger().info(f"Image topic: {image_topic}")
 
+        
+        image_out_topic = (
+            self.get_parameter("image_out_topic").get_parameter_value().string_value
+        )
+        self.get_logger().info(f"Image out topic: {image_out_topic}")
+
         info_topic = (
             self.get_parameter("camera_info_topic").get_parameter_value().string_value
         )
@@ -139,14 +154,15 @@ class ArucoNode(rclpy.node.Node):
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
+        self.image_out_pub = self.create_publisher(Image, image_out_topic, 10)
 
         # Set up fields for camera parameters
         self.info_msg = None
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.aruco_parameters = cv2.aruco.DetectorParameters()
         self.bridge = CvBridge()
 
     def info_callback(self, info_msg):
@@ -177,36 +193,53 @@ class ArucoNode(rclpy.node.Node):
         corners, marker_ids, rejected = cv2.aruco.detectMarkers(
             cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
         )
-        if marker_ids is not None:
-            if cv2.__version__ > "4.0.0":
+
+        cv2.aruco.drawDetectedMarkers(cv_image, corners)
+
+        if marker_ids is not None and len(corners) > 0:            
+            for i in range(0, len(corners)):
+                marker_id = marker_ids[i]
+                
                 rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
+                    corners[i], self.marker_size, self.intrinsic_mat, self.distortion
                 )
-            else:
-                rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, self.marker_size, self.intrinsic_mat, self.distortion
-                )
-            for i, marker_id in enumerate(marker_ids):
-                pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
 
-                rot_matrix = np.eye(4)
-                rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
-                quat = tf_transformations.quaternion_from_matrix(rot_matrix)
+                try:
+                    cv2.drawFrameAxes(cv_image, self.intrinsic_mat, self.distortion, rvecs[0], tvecs[0], 0.1)
 
-                pose.orientation.x = quat[0]
-                pose.orientation.y = quat[1]
-                pose.orientation.z = quat[2]
-                pose.orientation.w = quat[3]
+                    (topLeft, topRight, bottomRight, bottomLeft) = corners[i].reshape((4, 2))
 
-                pose_array.poses.append(pose)
-                markers.poses.append(pose)
-                markers.marker_ids.append(marker_id[0])
+                    pose_2d = Pose2D()
+                    pose_2d.x = float(topRight[0])
+                    pose_2d.y = float(topRight[1])
+
+                    pose = Pose()
+                    pose.position.x = tvecs[0][0][0]
+                    pose.position.y = tvecs[0][0][1]
+                    pose.position.z = tvecs[0][0][2]
+
+                    rot_matrix = np.eye(4)
+                    rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[0][0]))[0]
+                    quat = tf_transformations.quaternion_from_matrix(rot_matrix)
+
+                    pose.orientation.x = quat[0]
+                    pose.orientation.y = quat[1]
+                    pose.orientation.z = quat[2]
+                    pose.orientation.w = quat[3]
+
+                    pose_array.poses.append(pose)
+                    markers.poses_2d.append(pose_2d)
+                    markers.poses.append(pose)
+                    markers.marker_ids.append(marker_id[0])
+
+                except Exception as e:
+                    self.get_logger().warn("An exception occurred " + str(e))
+
+
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
+            self.image_out_pub.publish(self.bridge.cv2_to_imgmsg(cv_image, 'mono8'))
 
 
 def main():
